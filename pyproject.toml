@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zarr-daos"
+version = "0.1.0"
+description = "Native PyDAOS storage backend and daos:// URL adapter for Zarr-Python 3"
+requires-python = ">=3.11"
+dependencies = [
+    "zarr>=3.4.0",
+    "numpy>=1.26.0",
+]
+
+[project.entry-points."zarr.url_adapters"]
+daos = "zarr_daos.adapter:DAOSURLAdapter"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
