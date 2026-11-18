@@ -35,24 +35,33 @@ class DAOSStore(Store):
         self._ddict: pydaos.DDict | None = None
 
     async def _open(self) -> None:
-        if self._ddict is not None:
-            return
+        await super()._open()
 
-        def _connect() -> tuple[pydaos.DCont, pydaos.DDict]:
+        def _connect() -> tuple[pydaos.DCont, pydaos.DDict | None]:
             dcont = pydaos.DCont(self.pool, self.cont)
             try:
                 ddict = dcont.get(self.dict_name)
             except KeyError:
-                if not self._create_dict or self.read_only:
-                    raise
-                ddict = dcont.dict(self.dict_name)
+                if self.read_only or not self._create_dict:
+                    ddict = None
+                else:
+                    ddict = dcont.dict(self.dict_name)
             return dcont, ddict
 
         self._dcont, self._ddict = await asyncio.to_thread(_connect)
 
-    def _ensure_open(self) -> pydaos.DDict:
-        if self._ddict is None:
-            raise RuntimeError("DAOSStore is not open. Call 'await store.open()' first.")
+    async def _get_ddict(self) -> pydaos.DDict | None:
+        if not self._is_open:
+            await self._open()
+        # If opened read-only before dict existed, check if another handle created it since
+        if self._ddict is None and self._dcont is not None:
+            def _retry_get() -> pydaos.DDict | None:
+                try:
+                    return self._dcont.get(self.dict_name)  # type: ignore[union-attr]
+                except KeyError:
+                    return None
+
+            self._ddict = await asyncio.to_thread(_retry_get)
         return self._ddict
 
     async def get(
@@ -61,7 +70,12 @@ class DAOSStore(Store):
         prototype: BufferPrototype,
         byte_range: ByteRequest | None = None,
     ) -> Buffer | None:
-        ddict = self._ensure_open()
+        if byte_range is not None:
+            self._validate_byte_range(byte_range)
+
+        ddict = await self._get_ddict()
+        if ddict is None:
+            return None
 
         def _read() -> bytes | None:
             try:
@@ -83,10 +97,17 @@ class DAOSStore(Store):
         prototype: BufferPrototype,
         key_ranges: Iterable[tuple[str, ByteRequest | None]],
     ) -> list[Buffer | None]:
-        ddict = self._ensure_open()
         requests = list(key_ranges)
         if not requests:
             return []
+
+        for _, byte_range in requests:
+            if byte_range is not None:
+                self._validate_byte_range(byte_range)
+
+        ddict = await self._get_ddict()
+        if ddict is None:
+            return [None] * len(requests)
 
         unique_keys = list(dict.fromkeys(key for key, _ in requests))
 
@@ -116,7 +137,8 @@ class DAOSStore(Store):
 
     async def set(self, key: str, value: Buffer) -> None:
         self._check_writable()
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        assert ddict is not None
         payload = value.to_bytes()
 
         def _write() -> None:
@@ -126,7 +148,8 @@ class DAOSStore(Store):
 
     async def set_if_not_exists(self, key: str, value: Buffer) -> None:
         self._check_writable()
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        assert ddict is not None
         payload = value.to_bytes()
 
         def _write_if_missing() -> None:
@@ -137,7 +160,9 @@ class DAOSStore(Store):
 
     async def delete(self, key: str) -> None:
         self._check_writable()
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        if ddict is None:
+            return
 
         def _del() -> None:
             try:
@@ -149,7 +174,10 @@ class DAOSStore(Store):
 
     async def delete_dir(self, prefix: str) -> None:
         self._check_writable()
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        if ddict is None:
+            return
+
         normalized = prefix.rstrip("/")
         if normalized:
             normalized += "/"
@@ -159,7 +187,6 @@ class DAOSStore(Store):
             if not to_delete:
                 return
             if hasattr(ddict, "bput"):
-                # PyDAOS bput removes keys mapped to None
                 ddict.bput({k: None for k in to_delete})
             else:
                 for k in to_delete:
@@ -171,11 +198,15 @@ class DAOSStore(Store):
         await asyncio.to_thread(_del_prefix)
 
     async def exists(self, key: str) -> bool:
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        if ddict is None:
+            return False
         return await asyncio.to_thread(lambda: key in ddict)
 
     async def getsize(self, key: str) -> int:
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        if ddict is None:
+            raise FileNotFoundError(key)
 
         def _size() -> int:
             try:
@@ -186,7 +217,9 @@ class DAOSStore(Store):
         return await asyncio.to_thread(_size)
 
     async def list(self) -> AsyncIterator[str]:
-        ddict = self._ensure_open()
+        ddict = await self._get_ddict()
+        if ddict is None:
+            return
         keys = await asyncio.to_thread(lambda: list(ddict.keys()))
         for key in keys:
             yield key
@@ -217,14 +250,24 @@ class DAOSStore(Store):
         super().close()
 
     @staticmethod
-    def _slice_bytes(data: bytes, byte_range: ByteRequest) -> bytes:
+    def _validate_byte_range(byte_range: ByteRequest) -> None:
+        if not (
+            (hasattr(byte_range, "start") and hasattr(byte_range, "end"))
+            or hasattr(byte_range, "offset")
+            or hasattr(byte_range, "suffix")
+        ):
+            raise ValueError(f"Unexpected byte_range, got {byte_range!r}")
+
+    @classmethod
+    def _slice_bytes(cls, data: bytes, byte_range: ByteRequest) -> bytes:
+        cls._validate_byte_range(byte_range)
         if hasattr(byte_range, "start") and hasattr(byte_range, "end"):
             return data[byte_range.start : byte_range.end]
         if hasattr(byte_range, "offset"):
             return data[byte_range.offset :]
         if hasattr(byte_range, "suffix"):
             return data[-byte_range.suffix :]
-        return data
+        raise ValueError(f"Unexpected byte_range, got {byte_range!r}")
 
     def __repr__(self) -> str:
         return (
