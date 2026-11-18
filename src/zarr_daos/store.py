@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pydaos
+try:
+    import pydaos
+except ImportError:
+    pydaos = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    import pydaos as pydaos_types
+
 from zarr.abc.store import ByteRequest, Store
 from zarr.core.buffer import Buffer, BufferPrototype
-
 
 class DAOSStore(Store):
     """Zarr-Python 3 Store backed by a PyDAOS Key-Value dictionary (DDict)."""
@@ -35,6 +41,11 @@ class DAOSStore(Store):
         self._ddict: pydaos.DDict | None = None
 
     async def _open(self) -> None:
+        if pydaos is None:
+            raise ImportError(
+                "The 'pydaos' module is not available. Load your DAOS environment module "
+                "or add PyDAOS to PYTHONPATH before opening a DAOSStore."
+            )
         await super()._open()
 
         def _connect() -> tuple[pydaos.DCont, pydaos.DDict | None]:
