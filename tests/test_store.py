@@ -13,6 +13,7 @@ import zarr
 from zarr.codecs import BloscCodec, BytesCodec, ShardingCodec
 from zarr.core.buffer import Buffer, cpu
 from zarr.testing.store import StoreTests
+from zarr_daos.store import DAOSStore, _decode_payload, _encode_payload
 
 if os.environ.get("USE_MOCK_DAOS") == "1" and "pydaos" not in sys.modules:
     _CONTAINERS: dict[tuple[str, str], dict[str, dict[str, bytes]]] = {}
@@ -49,21 +50,26 @@ if os.environ.get("USE_MOCK_DAOS") == "1" and "pydaos" not in sys.modules:
     mock_mod.DDict = _MockDDict  # type: ignore[attr-defined]
     sys.modules["pydaos"] = mock_mod
 
-import pydaos  # noqa: E402
 from zarr_daos.adapter import store_from_daos_url  # noqa: E402
 from zarr_daos.store import DAOSStore  # noqa: E402
 
 DAOS_POOL = os.environ.get("DAOS_TEST_POOL", "test_pool")
 DAOS_CONT = os.environ.get("DAOS_TEST_CONT", "test_cont")
 
+try:
+    import pydaos  # noqa: E402
+except ImportError:
+    pydaos = None  # type: ignore[assignment]
+
 
 def _daos_available() -> bool:
+    if pydaos is None:
+        return False
     try:
         pydaos.DCont(DAOS_POOL, DAOS_CONT)
         return True
     except Exception:
         return False
-
 
 pytestmark = pytest.mark.skipif(
     not _daos_available(),
@@ -89,19 +95,21 @@ class TestDAOSStoreCompliance(StoreTests[DAOSStore, cpu.Buffer]):
 
     async def get(self, store: DAOSStore, key: str) -> Buffer:
         def _raw_get() -> bytes:
-            return pydaos.DCont(store.pool, store.cont).get(store.dict_name)[key]
+            raw = pydaos.DCont(store.pool, store.cont).get(store.dict_name)[key]
+            return _decode_payload(raw)
 
-        raw = await asyncio.to_thread(_raw_get)
-        return self.buffer_cls.from_bytes(raw)
+        data = await asyncio.to_thread(_raw_get)
+        return self.buffer_cls.from_bytes(data)
 
     async def set(self, store: DAOSStore, key: str, value: Buffer) -> None:
-        payload = value.to_bytes()
+        payload = _encode_payload(value.to_bytes())
+        not_found = (KeyError, getattr(pydaos, "DObjNotFound", KeyError))
 
         def _raw_set() -> None:
             dcont = pydaos.DCont(store.pool, store.cont)
             try:
                 ddict = dcont.get(store.dict_name)
-            except KeyError:
+            except not_found:
                 ddict = dcont.dict(store.dict_name)
             ddict[key] = payload
 
