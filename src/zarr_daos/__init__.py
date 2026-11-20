@@ -1,4 +1,6 @@
 from zarr_daos.adapter import store_from_daos_url
-from zarr_daos.store import DAOSStore
+from zarr_daos.libdaos_store import DAOSArrayStore
 
-__all__ = ["DAOSStore", "store_from_daos_url"]
+DAOSStore = DAOSArrayStore
+
+__all__ = ["DAOSArrayStore", "DAOSStore", "store_from_daos_url"]

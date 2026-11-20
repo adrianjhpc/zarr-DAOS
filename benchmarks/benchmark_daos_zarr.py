@@ -14,6 +14,22 @@ from zarr.storage import LocalStore
 
 from zarr_daos import DAOSStore
 
+import os
+import zarr.storage._local as _zlocal
+
+from zarr_daos.libdaos_store import DAOSArrayStore
+
+def _pil4dfs_safe_delete_dir(path, prefix=""):
+    if not os.path.exists(path):
+        return
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files:
+            os.unlink(os.path.join(root, name))
+        for name in dirs:
+            os.rmdir(os.path.join(root, name))
+    os.rmdir(path)
+
+_zlocal._delete_dir = _pil4dfs_safe_delete_dir
 
 @dataclass
 class BenchResult:
@@ -41,16 +57,19 @@ def _time_fn(fn, repeats: int = 3) -> float:
         times.append(time.perf_counter() - t0)
     return statistics.median(times)
 
-
 def bench_chunk_sweep(
     pool: str,
     cont: str,
     concurrency: int,
     dfuse_dir: Path | None = None,
+    posix_cont: str | None = None,
 ) -> list[BenchResult]:
     """Benchmark 1: Sweep chunk sizes (64 KiB, 1 MiB, 8 MiB) on a 256 MiB float32 array."""
     zarr.config.set({"async.concurrency": concurrency})
     results: list[BenchResult] = []
+
+    if isinstance(dfuse_dir, str):
+        dfuse_dir = Path(dfuse_dir)
 
     # 256 MiB float32 array: (64, 1024, 1024)
     shape = (64, 1024, 1024)
@@ -82,9 +101,43 @@ def bench_chunk_sweep(
             arr = zarr.open_array(store=store, mode="r")
             _ = arr[:]
 
+        print("    -> starting write...", flush=True)
         w_time = _time_fn(_write, repeats=2)
+        print(f"    -> write done ({w_time:.2f}s), starting read...", flush=True)
         r_time = _time_fn(_read, repeats=3)
         results.append(BenchResult(f"DAOSStore | {label}", total_mib, w_time, r_time))
+
+    if posix_cont is not None:
+        for label, chunks in chunk_configs:
+             print(f"  [1/3] Chunk sweep (libdaos Array): {label}...", flush=True)
+             array_store = DAOSArrayStore(
+                 pool=pool,
+                 cont=posix_cont,
+                 prefix=f"bench_arr_{uuid.uuid4().hex}",
+             )
+             try:
+                 def _write_arr() -> None:
+                     arr = zarr.create_array(
+                         store=array_store,
+                         shape=shape,
+                         chunks=chunks,
+                         dtype="float32",
+                         compressors=[BloscCodec(cname="lz4", clevel=1, shuffle="bitshuffle")],
+                         overwrite=True,
+                     )
+                     arr[:] = data
+
+                 def _read_arr() -> None:
+                     arr = zarr.open_array(store=array_store, mode="r")
+                     _ = arr[:]
+
+                 print("    -> starting write...", flush=True)
+                 w_time = _time_fn(_write_arr, repeats=2)
+                 print(f"    -> write done ({w_time:.2f}s), starting read...", flush=True)
+                 r_time = _time_fn(_read_arr, repeats=3)
+                 results.append(BenchResult(f"DAOSArrayStore | {label}", total_mib, w_time, r_time))
+             finally:
+                 array_store.close()
 
     # Optional baseline against dfuse LocalStore at 1 MiB chunks
     if dfuse_dir is not None:
@@ -112,27 +165,23 @@ def bench_chunk_sweep(
 
     return results
 
-
 def bench_sharding_and_subvolume(pool: str, cont: str, concurrency: int) -> BenchResult:
-    """Benchmark 2: ShardingCodec (16 MiB shards, 256 KiB inner chunks) + random ROI read."""
+    """Benchmark 2: Sharding (16 MiB shards, 256 KiB inner chunks) + random ROI read."""
     zarr.config.set({"async.concurrency": concurrency})
     shape = (128, 1024, 1024)  # 512 MiB float32
     data = np.random.default_rng(7).standard_normal(shape, dtype=np.float32)
     total_mib = data.nbytes / (1024**2)
 
-    shard_codec = ShardingCodec(
-        chunk_shape=(16, 64, 64),  # 256 KiB inner chunks
-        codecs=[BytesCodec(), BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")],
-    )
     store = DAOSStore(pool=pool, cont=cont, dict_name=f"bench_shard_{uuid.uuid4().hex}")
 
     def _write() -> None:
         arr = zarr.create_array(
             store=store,
             shape=shape,
-            chunks=(64, 256, 256),  # 16 MiB outer shards (32 shards total)
+            shards=(64, 256, 256),  # 16 MiB outer shards (32 shards total)
+            chunks=(16, 64, 64),    # 256 KiB inner chunks
             dtype="float32",
-            codecs=[shard_codec],
+            compressors=[BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")],
             overwrite=True,
         )
         arr[:] = data
@@ -141,6 +190,7 @@ def bench_sharding_and_subvolume(pool: str, cont: str, concurrency: int) -> Benc
         arr = zarr.open_array(store=store, mode="r")
         _ = arr[:]
 
+    print("  [2/3] Sharded (16 MiB shards / 256 KiB chunks)...", flush=True)
     w_time = _time_fn(_write, repeats=2)
     r_time = _time_fn(_read_full, repeats=3)
 
@@ -155,7 +205,6 @@ def bench_sharding_and_subvolume(pool: str, cont: str, concurrency: int) -> Benc
         read_s=r_time,
         extra=f"ROI slice latency: {roi_ms:.1f} ms",
     )
-
 
 def bench_domain_access_patterns(pool: str, cont: str, concurrency: int) -> list[BenchResult]:
     """Benchmark 3: Radio spectral cube (spatial vs. spectral) & MRI orthogonal slicing."""
@@ -238,12 +287,13 @@ def main() -> None:
     parser.add_argument("--cont", required=True, help="DAOS container label or UUID (--type=PYTHON)")
     parser.add_argument("--concurrency", type=int, default=64, help="Zarr async.concurrency setting")
     parser.add_argument("--dfuse-path", type=Path, default=None, help="Optional dfuse mount path for comparison")
+    parser.add_argument("--posix-cont", default=None, help="POSIX container label for DAOSArrayStore")
     args = parser.parse_args()
 
     print(f"\nRunning DAOS-Zarr Benchmarks | Pool: {args.pool} | Cont: {args.cont} | async.concurrency={args.concurrency}\n")
 
     all_results: list[BenchResult] = []
-    all_results.extend(bench_chunk_sweep(args.pool, args.cont, args.concurrency, args.dfuse_path))
+    all_results.extend(bench_chunk_sweep(args.pool, args.cont, args.concurrency, args.dfuse_path, posix_cont=args.posix_cont))
     all_results.append(bench_sharding_and_subvolume(args.pool, args.cont, args.concurrency))
     all_results.extend(bench_domain_access_patterns(args.pool, args.cont, args.concurrency))
 

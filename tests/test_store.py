@@ -13,7 +13,7 @@ import zarr
 from zarr.codecs import BloscCodec, BytesCodec, ShardingCodec
 from zarr.core.buffer import Buffer, cpu
 from zarr.testing.store import StoreTests
-from zarr_daos.store import DAOSStore, _decode_payload, _encode_payload
+from zarr_daos.libdaos_store import DAOSArrayStore as DAOSStore
 
 if os.environ.get("USE_MOCK_DAOS") == "1" and "pydaos" not in sys.modules:
     _CONTAINERS: dict[tuple[str, str], dict[str, dict[str, bytes]]] = {}
@@ -51,7 +51,7 @@ if os.environ.get("USE_MOCK_DAOS") == "1" and "pydaos" not in sys.modules:
     sys.modules["pydaos"] = mock_mod
 
 from zarr_daos.adapter import store_from_daos_url  # noqa: E402
-from zarr_daos.store import DAOSStore  # noqa: E402
+from zarr_daos.libdaos_store import DAOSArrayStore as DAOSStore  # noqa: E402
 
 DAOS_POOL = os.environ.get("DAOS_TEST_POOL", "test_pool")
 DAOS_CONT = os.environ.get("DAOS_TEST_CONT", "test_cont")
