@@ -8,6 +8,7 @@ import json
 import math
 from typing import AsyncGenerator, Iterable
 
+import numpy as np
 from zarr.abc.store import ByteRequest, OffsetByteRequest, RangeByteRequest, Store, SuffixByteRequest
 from zarr.core.buffer import Buffer, BufferPrototype, default_buffer_prototype
 
@@ -17,6 +18,13 @@ _STRIPE_THRESHOLD = 256 * 1024  # Use OC_SX multi-target striping at >= 256 KiB
 _DER_EXIST = -1004
 _DER_NONEXIST = -1005
 
+def _buf_to_mv(buf: Buffer) -> memoryview:
+    try:
+        arr = buf.as_array_like()
+        mv = memoryview(arr)
+        return mv if mv.format == "B" else mv.cast("B")
+    except Exception:
+        return memoryview(buf.to_bytes())
 
 def _is_chunk_key(key: str) -> bool:
     leaf = key.rsplit("/", 1)[-1]
@@ -30,14 +38,22 @@ def _infer_chunk_bytes_from_zarr_json(raw: bytes | memoryview) -> int | None:
         meta = json.loads(bytes(raw))
         chunk_shape = meta["chunk_grid"]["configuration"]["chunk_shape"]
         dtype_str = str(meta["data_type"])
-        itemsize = 8 if any(x in dtype_str for x in ("64", "complex64")) else (
-            2 if "16" in dtype_str else (1 if "8" in dtype_str and "128" not in dtype_str else 4)
+        itemsize = (
+            8
+            if any(x in dtype_str for x in ("64", "complex64"))
+            else (2 if "16" in dtype_str else (1 if "8" in dtype_str and "128" not in dtype_str else 4))
         )
         if "complex128" in dtype_str:
             itemsize = 16
         return math.prod(int(d) for d in chunk_shape) * itemsize
     except Exception:
         return None
+
+
+def _mv_to_void_ptr(mv: memoryview) -> tuple[ctypes.c_void_p, object]:
+    """Return a zero-copy void* pointer and keepalive object for any readable memoryview (even readonly)."""
+    arr = np.frombuffer(mv, dtype=np.uint8)
+    return arr.ctypes.data_as(ctypes.c_void_p), arr
 
 
 class _GlobalDAOSContext:
@@ -139,9 +155,15 @@ class DAOSArrayStore(Store):
         self.stripe_size = stripe_size
         self._kv_oh = ffi.daos_handle_t(ffi.DAOS_HDL_INVAL)
         self._chunk_bytes_hint: int | None = None
-
         _CTX.ensure_open(pool, cont)
         _CTX.executor.submit(self._open_kv_sync).result()
+
+    async def _open(self) -> None:
+        await super()._open()
+        if self._kv_oh.value == ffi.DAOS_HDL_INVAL:
+            _CTX.ensure_open(self.pool, self.cont)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_CTX.executor, self._open_kv_sync)
 
     def _full_key(self, key: str) -> str:
         clean = key.lstrip("/")
@@ -156,6 +178,8 @@ class DAOSArrayStore(Store):
         )
 
     def close(self) -> None:
+        super().close()
+        self._is_open = False
         if self._kv_oh.value != ffi.DAOS_HDL_INVAL:
             kv = self._kv_oh
             self._kv_oh = ffi.daos_handle_t(ffi.DAOS_HDL_INVAL)
@@ -184,9 +208,11 @@ class DAOSArrayStore(Store):
         b_key = fkey.encode("utf-8")
         sz = ffi.daos_size_t(ffi.DAOS_REC_ANY)
         rc = ffi.libdaos.daos_kv_get(self._kv_oh, ffi.DAOS_TX_NONE, 0, b_key, ctypes.byref(sz), None, None)
-        if rc == _DER_NONEXIST or sz.value == 0:
+        if rc == _DER_NONEXIST:
             return None
         ffi.check_rc(rc, f"kv_get_size({fkey})")
+        if sz.value == 0:
+            return bytearray(0)
 
         out = bytearray(sz.value)
         c_buf = (ctypes.c_char * sz.value).from_buffer(out)
@@ -210,13 +236,12 @@ class DAOSArrayStore(Store):
                 f"kv_put({fkey})",
             )
             return
-        c_buf = (ctypes.c_char * nbytes).from_buffer(mv) if not mv.readonly else ctypes.c_char_p(bytes(mv))
+        ptr, keep = _mv_to_void_ptr(mv)
         ffi.check_rc(
-            ffi.libdaos.daos_kv_put(
-                self._kv_oh, ffi.DAOS_TX_NONE, 0, b_key, nbytes, ctypes.cast(c_buf, ctypes.c_void_p), None
-            ),
+            ffi.libdaos.daos_kv_put(self._kv_oh, ffi.DAOS_TX_NONE, 0, b_key, nbytes, ptr, None),
             f"kv_put({fkey})",
         )
+        del keep
 
     # --- Pipelined Batch Array Write / Read ---
 
@@ -232,52 +257,70 @@ class DAOSArrayStore(Store):
                 _CTX.coh, oid, ffi.DAOS_TX_NONE, ffi.DAOS_OO_RW,
                 ctypes.byref(cell_sz), ctypes.byref(chunk_sz), ctypes.byref(aoh), None,
             )
-        ffi.check_rc(rc, f"array_create_or_open({fkey})")
+            ffi.check_rc(rc, f"array_open_rw({fkey})")
+            # Truncate existing array to exact target size before writing
+            ffi.check_rc(
+                ffi.libdaos.daos_array_set_size(aoh, ffi.DAOS_TX_NONE, nbytes, None),
+                f"array_set_size({fkey})",
+            )
+        else:
+            ffi.check_rc(rc, f"array_create({fkey})")
         return aoh
 
     def _write_arrays_batch_sync(self, chunk_items: list[tuple[str, memoryview]]) -> None:
         if not chunk_items:
             return
-        n = len(chunk_items)
-        events = (ffi.daos_event_t * n)()
-        aohs: list[ffi.daos_handle_t] = []
-        keepalive: list[object] = []
 
-        for i, (fkey, mv) in enumerate(chunk_items):
+        non_empty: list[tuple[str, memoryview, ffi.daos_handle_t]] = []
+        for fkey, mv in chunk_items:
             nbytes = len(mv)
             aoh = self._open_or_create_array(fkey, nbytes)
-            aohs.append(aoh)
+            if nbytes == 0:
+                # 0-byte array is already created with size 0; never post a 0-len async I/O
+                ffi.libdaos.daos_array_close(aoh, None)
+            else:
+                non_empty.append((fkey, mv, aoh))
 
-            ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "event_init")
-            c_buf = (ctypes.c_char * nbytes).from_buffer(mv) if not mv.readonly else ctypes.c_char_p(bytes(mv))
-            iov = ffi.d_iov_t(iov_buf=ctypes.cast(c_buf, ctypes.c_void_p), iov_buf_len=nbytes, iov_len=nbytes)
-            sgl = ffi.d_sg_list_t(sg_nr=1, sg_nr_out=0, sg_iovs=ctypes.pointer(iov))
-            rg = ffi.daos_range_t(rg_len=nbytes, rg_idx=0)
-            iod = ffi.daos_array_iod_t(arr_nr=1, arr_rgs=ctypes.pointer(rg), arr_nr_short_read=0)
-            keepalive.extend((c_buf, iov, sgl, rg, iod))
+        m = len(non_empty)
+        if m > 0:
+            events = (ffi.daos_event_t * m)()
+            keepalive: list[object] = []
 
-            ffi.check_rc(
-                ffi.libdaos.daos_array_write(
-                    aoh, ffi.DAOS_TX_NONE, ctypes.byref(iod), ctypes.byref(sgl), ctypes.byref(events[i])
-                ),
-                f"array_write_async({fkey})",
-            )
+            for i, (fkey, mv, aoh) in enumerate(non_empty):
+                nbytes = len(mv)
+                ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "event_init")
+                ptr, arr_keep = _mv_to_void_ptr(mv)
+                iov = ffi.d_iov_t(iov_buf=ptr, iov_buf_len=nbytes, iov_len=nbytes)
+                sgl = ffi.d_sg_list_t(sg_nr=1, sg_nr_out=0, sg_iovs=ctypes.pointer(iov))
+                rg = ffi.daos_range_t(rg_len=nbytes, rg_idx=0)
+                iod = ffi.daos_array_iod_t(arr_nr=1, arr_rgs=ctypes.pointer(rg), arr_nr_short_read=0)
+                keepalive.extend((arr_keep, iov, sgl, rg, iod))
 
-        # Wait for all n RDMA transfers concurrently
-        ev_ptrs = (ctypes.POINTER(ffi.daos_event_t) * n)()
-        completed = 0
-        try:
-            while completed < n:
-                rc = ffi.libdaos.daos_eq_poll(_CTX.eqh, 1, ffi.DAOS_EQ_WAIT, n - completed, ev_ptrs)
-                if rc < 0:
-                    ffi.check_rc(rc, "daos_eq_poll(write)")
-                for j in range(rc):
-                    ffi.check_rc(ev_ptrs[j].contents.ev_error, "array_write_completion")
-                completed += rc
-        finally:
-            for i in range(n):
-                ffi.libdaos.daos_event_fini(ctypes.byref(events[i]))
-                ffi.libdaos.daos_array_close(aohs[i], None)
+                ffi.check_rc(
+                    ffi.libdaos.daos_array_write(
+                        aoh, ffi.DAOS_TX_NONE, ctypes.byref(iod), ctypes.byref(sgl), ctypes.byref(events[i])
+                    ),
+                    f"array_write_async({fkey})",
+                )
+
+            ev_ptrs = (ctypes.POINTER(ffi.daos_event_t) * m)()
+            completed = 0
+            try:
+                while completed < m:
+                    rc = ffi.libdaos.daos_eq_poll(_CTX.eqh, 1, ffi.DAOS_EQ_WAIT, m - completed, ev_ptrs)
+                    if rc < 0:
+                        ffi.check_rc(rc, "daos_eq_poll(write)")
+                    for j in range(rc):
+                        ffi.check_rc(ev_ptrs[j].contents.ev_error, "array_write_completion")
+                    completed += rc
+            finally:
+                for i, (_, _, aoh) in enumerate(non_empty):
+                    ffi.libdaos.daos_event_fini(ctypes.byref(events[i]))
+                    ffi.libdaos.daos_array_close(aoh, None)
+
+        # Record chunk keys in KV index so StoreTests list/list_prefix/list_dir see all keys
+        for fkey, _ in chunk_items:
+            self._kv_put_sync(fkey, memoryview(b"\x01"))
 
     def _read_arrays_batch_sync(
         self, chunk_reqs: list[tuple[str, ByteRequest | None]]
@@ -286,10 +329,8 @@ class DAOSArrayStore(Store):
             return []
 
         results: list[bytearray | None] = [None] * len(chunk_reqs)
-        active: list[tuple[int, ffi.daos_handle_t, bytearray]] = []
-        keepalive: list[object] = []
+        active: list[tuple[int, ffi.daos_handle_t, bytearray, int, int]] = []
 
-        # Open existing arrays and determine read lengths
         for idx, (fkey, br) in enumerate(chunk_reqs):
             oid = self._array_oid(fkey)
             aoh = ffi.daos_handle_t()
@@ -302,23 +343,24 @@ class DAOSArrayStore(Store):
                 continue
             ffi.check_rc(rc, f"array_open_ro({fkey})")
 
+            total_sz = ffi.daos_size_t()
+            ffi.check_rc(
+                ffi.libdaos.daos_array_get_size(aoh, ffi.DAOS_TX_NONE, ctypes.byref(total_sz), None),
+                f"array_get_size({fkey})",
+            )
+            size = total_sz.value
+
             if isinstance(br, RangeByteRequest):
                 offset = br.start
-                length = max(0, br.end - br.start)
+                length = max(0, min(br.end, size) - offset)
+            elif isinstance(br, OffsetByteRequest):
+                offset = br.offset
+                length = max(0, size - offset)
+            elif isinstance(br, SuffixByteRequest):
+                length = min(br.suffix, size)
+                offset = size - length
             else:
-                total_sz = ffi.daos_size_t()
-                ffi.check_rc(
-                    ffi.libdaos.daos_array_get_size(aoh, ffi.DAOS_TX_NONE, ctypes.byref(total_sz), None),
-                    f"array_get_size({fkey})",
-                )
-                size = total_sz.value
-                if isinstance(br, OffsetByteRequest):
-                    offset, length = br.offset, max(0, size - br.offset)
-                elif isinstance(br, SuffixByteRequest):
-                    length = min(br.suffix, size)
-                    offset = size - length
-                else:
-                    offset, length = 0, size
+                offset, length = 0, size
 
             out = bytearray(length)
             results[idx] = out
@@ -326,16 +368,15 @@ class DAOSArrayStore(Store):
                 ffi.libdaos.daos_array_close(aoh, None)
                 continue
 
-            active.append((idx, aoh, out))
-            keepalive.append((offset, length))
+            active.append((idx, aoh, out, offset, length))
 
         m = len(active)
         if m == 0:
             return results
 
         events = (ffi.daos_event_t * m)()
-        for i, (orig_idx, aoh, out) in enumerate(active):
-            offset, length = keepalive[i]  # type: ignore[misc]
+        keepalive: list[object] = []
+        for i, (_, aoh, out, offset, length) in enumerate(active):
             ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "event_init")
             c_buf = (ctypes.c_char * length).from_buffer(out)
             iov = ffi.d_iov_t(iov_buf=ctypes.cast(c_buf, ctypes.c_void_p), iov_buf_len=length, iov_len=0)
@@ -362,7 +403,7 @@ class DAOSArrayStore(Store):
                     ffi.check_rc(ev_ptrs[j].contents.ev_error, "array_read_completion")
                 completed += rc
         finally:
-            for i, (_, aoh, _) in enumerate(active):
+            for i, (_, aoh, _, _, _) in enumerate(active):
                 ffi.libdaos.daos_event_fini(ctypes.byref(events[i]))
                 ffi.libdaos.daos_array_close(aoh, None)
 
@@ -384,6 +425,7 @@ class DAOSArrayStore(Store):
         prototype: BufferPrototype,
         key_ranges: Iterable[tuple[str, ByteRequest | None]],
     ) -> list[Buffer | None]:
+        self._check_open()
         loop = asyncio.get_running_loop()
         reqs = list(key_ranges)
 
@@ -425,9 +467,9 @@ class DAOSArrayStore(Store):
         await self.set_many([(key, value)])
 
     async def set_many(self, values: Iterable[tuple[str, Buffer]]) -> None:
+        self._check_open()
         self._check_writable()
-        items = [(key, self._full_key(key), memoryview(buf.as_numpy_array()).cast("B")) for key, buf in values]
-        loop = asyncio.get_running_loop()
+        items = [(key, self._full_key(key), _buf_to_mv(buf)) for key, buf in values]
 
         def _op() -> None:
             chunk_items: list[tuple[str, memoryview]] = []
@@ -443,6 +485,7 @@ class DAOSArrayStore(Store):
 
     async def exists(self, key: str) -> bool:
         fkey = self._full_key(key)
+        await self._ensure_open()
         loop = asyncio.get_running_loop()
 
         def _op() -> bool:
@@ -468,6 +511,7 @@ class DAOSArrayStore(Store):
     async def delete(self, key: str) -> None:
         self._check_writable()
         fkey = self._full_key(key)
+        await self._ensure_open()
         loop = asyncio.get_running_loop()
 
         def _op() -> None:
@@ -482,8 +526,7 @@ class DAOSArrayStore(Store):
                 if rc == 0:
                     ffi.libdaos.daos_array_destroy(aoh, ffi.DAOS_TX_NONE, None)
                     ffi.libdaos.daos_array_close(aoh, None)
-            else:
-                ffi.libdaos.daos_kv_remove(self._kv_oh, ffi.DAOS_TX_NONE, 0, fkey.encode("utf-8"), None)
+            ffi.libdaos.daos_kv_remove(self._kv_oh, ffi.DAOS_TX_NONE, 0, fkey.encode("utf-8"), None)
 
         await loop.run_in_executor(_CTX.executor, _op)
 
@@ -495,6 +538,7 @@ class DAOSArrayStore(Store):
 
         while not ffi.anchor_is_eof(anchor):
             nr = ctypes.c_uint32(256)
+            if nr.value == 0: break
             iov = ffi.d_iov_t(iov_buf=ctypes.cast(buf, ctypes.c_void_p), iov_buf_len=65536, iov_len=0)
             sgl = ffi.d_sg_list_t(sg_nr=1, sg_nr_out=0, sg_iovs=ctypes.pointer(iov))
             ffi.check_rc(
@@ -517,6 +561,7 @@ class DAOSArrayStore(Store):
         return keys
 
     async def list(self) -> AsyncGenerator[str, None]:
+        await self._ensure_open()
         loop = asyncio.get_running_loop()
         keys = await loop.run_in_executor(_CTX.executor, self._list_keys_sync)
         for k in keys:

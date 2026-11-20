@@ -90,7 +90,10 @@ class d_sg_list_t(ctypes.Structure):
 
 
 class daos_range_t(ctypes.Structure):
-    _fields_ = [("rg_len", daos_size_t), ("rg_idx", daos_off_t)]
+    _fields_ = [
+        ("rg_idx", ctypes.c_uint64),  # offset FIRST
+        ("rg_len", ctypes.c_uint64),  # length SECOND
+    ]
 
 
 class daos_array_iod_t(ctypes.Structure):
@@ -110,15 +113,29 @@ class daos_key_desc_t(ctypes.Structure):
     ]
 
 
+DAOS_ANCHOR_TYPE_ZERO = 0
+DAOS_ANCHOR_TYPE_EOF = 3
+DAOS_ANCHOR_BUF_MAX = 104
+
 class daos_anchor_t(ctypes.Structure):
     _fields_ = [
         ("da_type", ctypes.c_uint16),
         ("da_shard", ctypes.c_uint16),
         ("da_flags", ctypes.c_uint32),
         ("da_sub_anchors", ctypes.c_uint64),
-        ("da_buf", ctypes.c_uint8 * 112),
+        ("da_buf", ctypes.c_uint8 * DAOS_ANCHOR_BUF_MAX),
     ]
 
+
+def anchor_is_eof(anchor: daos_anchor_t) -> bool:
+    return anchor.da_type == DAOS_ANCHOR_TYPE_EOF
+
+
+class daos_range_t(ctypes.Structure):
+    _fields_ = [
+        ("rg_idx", ctypes.c_uint64),  # offset FIRST
+        ("rg_len", ctypes.c_uint64),  # length SECOND
+    ]
 
 # Function prototypes
 libdaos.daos_init.argtypes = []
@@ -225,6 +242,10 @@ libdaos.daos_array_destroy.restype = ctypes.c_int
 libdaos.daos_array_close.argtypes = [daos_handle_t, ctypes.c_void_p]
 libdaos.daos_array_close.restype = ctypes.c_int
 
+libdaos.daos_array_set_size.argtypes = [
+    daos_handle_t, daos_handle_t, daos_size_t, ctypes.c_void_p,
+]
+libdaos.daos_array_set_size.restype = ctypes.c_int
 
 def check_rc(rc: int, context: str) -> None:
     if rc != 0:
@@ -246,7 +267,3 @@ def make_oid(coh: daos_handle_t, seed: str, otype: int, oclass: int) -> daos_obj
     check_rc(libdaos.daos_obj_generate_oid(coh, ctypes.byref(oid), otype, oclass, 0, 0), f"generate_oid({seed})")
     return oid
 
-
-def anchor_is_eof(anchor: daos_anchor_t) -> bool:
-    # DAOS_ANCHOR_TYPE_EOF == 2
-    return anchor.da_type == 2
