@@ -173,7 +173,7 @@ class DAOSArrayStore(Store):
 
     def _open_kv_sync(self) -> None:
         o_flags = ffi.DAOS_OO_RO if self.read_only else ffi.DAOS_OO_RW
-        kv_oid = ffi.make_oid(_CTX.coh, f"zarr_root_kv:{self.prefix}", ffi.DAOS_OT_KV_HASHED, _CTX.oc_s1)
+        kv_oid = ffi.make_oid(_CTX.coh, f"zarr_root_kv:{self.prefix}", ffi.DAOS_OT_KV_HASHED, _CTX.oc_sx)
         ffi.check_rc(
             ffi.libdaos.daos_kv_open(_CTX.coh, kv_oid, o_flags, ctypes.byref(self._kv_oh), None),
             "daos_kv_open",
@@ -319,7 +319,8 @@ class DAOSArrayStore(Store):
     def _kv_get_sync(self, fkey: str) -> bytearray | None:
         b_key = fkey.encode("utf-8")
         # Fast path: 1-RPC fetch into a 256 KiB + 16 B buffer
-        buf_len = self._INLINE_THRESHOLD + 16
+        hint = self._chunk_bytes_hint
+        buf_len = (hint + 64) if (hint and hint <= self._INLINE_THRESHOLD) else (self._INLINE_THRESHOLD + 16)
         out = bytearray(buf_len)
         c_buf = (ctypes.c_char * buf_len).from_buffer(out)
         sz = ffi.daos_size_t(buf_len)
@@ -372,6 +373,98 @@ class DAOSArrayStore(Store):
         )
         del keep
 
+
+    def _kv_put_batch_sync(self, items: list[tuple[str, bytes | bytearray | memoryview]]) -> None:
+        m = len(items)
+        if m == 0:
+            return
+        if m == 1:
+            fkey, data = items[0]
+            self._kv_put_sync(fkey, memoryview(data))
+            return
+        events = (ffi.daos_event_t * m)()
+        keep: list[object] = []
+        for i, (fkey, data) in enumerate(items):
+            ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "kv_put_ev_init")
+            b_key = fkey.encode("utf-8")
+            mv = memoryview(data)
+            nbytes = len(mv)
+            ptr, arr_keep = _mv_to_void_ptr(mv) if nbytes else (None, None)
+            keep.extend((b_key, mv, arr_keep))
+            ffi.check_rc(
+                ffi.libdaos.daos_kv_put(self._kv_oh, ffi.DAOS_TX_NONE, 0, b_key, nbytes, ptr, ctypes.byref(events[i])),
+                f"kv_put_async({fkey})",
+            )
+        ev_ptrs = (ctypes.POINTER(ffi.daos_event_t) * m)()
+        completed = 0
+        try:
+            while completed < m:
+                rc = ffi.libdaos.daos_eq_poll(_CTX.eqh, 1, ffi.DAOS_EQ_WAIT, m - completed, ev_ptrs)
+                if rc < 0:
+                    ffi.check_rc(rc, "daos_eq_poll(kv_put)")
+                for j in range(rc):
+                    ffi.check_rc(ev_ptrs[j].contents.ev_error, "kv_put_completion")
+                completed += rc
+        finally:
+            for i in range(m):
+                ffi.libdaos.daos_event_fini(ctypes.byref(events[i]))
+
+    def _kv_get_batch_sync(self, fkeys: list[str]) -> list[bytearray | None]:
+        m = len(fkeys)
+        if m == 0:
+            return []
+        if m == 1:
+            return [self._kv_get_sync(fkeys[0])]
+        hint = self._chunk_bytes_hint
+        buf_len = (hint + 64) if (hint and hint <= self._INLINE_THRESHOLD) else (self._INLINE_THRESHOLD + 16)
+        events = (ffi.daos_event_t * m)()
+        sizes = [ffi.daos_size_t(buf_len) for _ in range(m)]
+        inited = [False] * m
+        outs = [bytearray(buf_len) for _ in range(m)]
+        c_bufs: list[object] = [(ctypes.c_char * buf_len).from_buffer(o) for o in outs]
+        b_keys = [k.encode("utf-8") for k in fkeys]
+        ev_to_idx: dict[int, int] = {}
+        submitted = 0
+        try:
+            for i in range(m):
+                ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "kv_get_ev_init")
+                inited[i] = True
+                ev_to_idx[ctypes.addressof(events[i])] = i
+                rc = ffi.libdaos.daos_kv_get(
+                    self._kv_oh, ffi.DAOS_TX_NONE, 0, b_keys[i], ctypes.byref(sizes[i]), c_bufs[i], ctypes.byref(events[i])
+                )
+                if rc == _DER_NONEXIST:
+                    sizes[i].value = 0
+                    ffi.libdaos.daos_event_fini(ctypes.byref(events[i]))
+                    inited[i] = False
+                else:
+                    ffi.check_rc(rc, f"kv_get_async({fkeys[i]})")
+                    submitted += 1
+
+            results: list[bytearray | None] = [None] * m
+            ev_ptrs = (ctypes.POINTER(ffi.daos_event_t) * max(1, submitted))()
+            completed = 0
+            while completed < submitted:
+                rc = ffi.libdaos.daos_eq_poll(_CTX.eqh, 1, ffi.DAOS_EQ_WAIT, submitted - completed, ev_ptrs)
+                if rc < 0:
+                    ffi.check_rc(rc, "daos_eq_poll(kv_get)")
+                for j in range(rc):
+                    ev_ptr = ev_ptrs[j]
+                    idx = ev_to_idx[ctypes.addressof(ev_ptr.contents)]
+                    err = ev_ptr.contents.ev_error
+                    if err == 0 and sizes[idx].value > 0:
+                        c_bufs[idx] = None  # release buffer export before resizing
+                        del outs[idx][sizes[idx].value :]
+                        results[idx] = outs[idx]
+                    elif err != _DER_NONEXIST:
+                        results[idx] = self._kv_get_sync(fkeys[idx])
+                completed += rc
+            return results
+        finally:
+            for i in range(m):
+                if inited[i]:
+                    ffi.libdaos.daos_event_fini(ctypes.byref(events[i]))
+
     # --- Pipelined Batch Array Write / Read ---
 
     def _open_or_create_array(self, fkey: str, nbytes: int) -> ffi.daos_handle_t:
@@ -402,6 +495,7 @@ class DAOSArrayStore(Store):
 
         non_empty: list[tuple[str, memoryview, ffi.daos_handle_t]] = []
         large_keys: list[str] = []
+        inline_kv: list[tuple[str, bytearray]] = []
         for fkey, mv in chunk_items:
             nbytes = len(mv)
             if nbytes <= self._INLINE_THRESHOLD:
@@ -409,11 +503,13 @@ class DAOSArrayStore(Store):
                 tagged[0] = 2  # inline KV payload marker
                 if nbytes:
                     tagged[1:] = mv
-                self._kv_put_sync(fkey, memoryview(tagged))
+                inline_kv.append((fkey, tagged))
             else:
                 aoh = self._open_or_create_array(fkey, nbytes)
                 non_empty.append((fkey, mv, aoh))
                 large_keys.append(fkey)
+        if inline_kv:
+            self._kv_put_batch_sync(inline_kv)
 
         m = len(non_empty)
         if m > 0:
@@ -468,8 +564,8 @@ class DAOSArrayStore(Store):
                     ffi.libdaos.daos_array_close(aoh, None)
 
         # Record chunk keys in KV index so StoreTests list/list_prefix/list_dir see all keys
-        for fkey in large_keys:
-            self._kv_put_sync(fkey, memoryview(b"\x01"))
+        if large_keys:
+            self._kv_put_batch_sync([(fkey, b"\x01") for fkey in large_keys])
 
     def _read_arrays_batch_sync(
         self, chunk_reqs: list[tuple[str, ByteRequest | None]]
@@ -481,9 +577,10 @@ class DAOSArrayStore(Store):
         active: list[tuple[int, ffi.daos_handle_t, bytearray, int, int]] = []
 
         prefer_kv = (self._chunk_bytes_hint is None) or (self._chunk_bytes_hint <= self._INLINE_THRESHOLD)
+        kv_vals = self._kv_get_batch_sync([fk for fk, _ in chunk_reqs]) if prefer_kv else None
         for idx, (fkey, br) in enumerate(chunk_reqs):
-            if prefer_kv:
-                kv_val = self._kv_get_sync(fkey)
+            if kv_vals is not None:
+                kv_val = kv_vals[idx]
                 if kv_val is None:
                     continue
                 if len(kv_val) >= 1 and kv_val[0] == 2:
@@ -590,6 +687,32 @@ class DAOSArrayStore(Store):
 
     # --- Zarr v3 Store Async API ---
 
+    def _flush_get_batch(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._get_scheduled = False
+        if getattr(self, "_get_in_flight", False) or not self._get_batch:
+            return
+        self._get_in_flight = True
+        batch = self._get_batch[:64]
+        del self._get_batch[:64]
+
+        async def _run() -> None:
+            try:
+                reqs = [(self._full_key(k), br) for k, br, _, _ in batch]
+                raws = await loop.run_in_executor(_CTX.executor, self._read_arrays_batch_sync, reqs)
+                for (_, _, proto, fut), raw in zip(batch, raws):
+                    if not fut.done():
+                        fut.set_result(proto.buffer.from_bytes(raw) if raw is not None else None)
+            except BaseException as exc:
+                for _, _, _, fut in batch:
+                    if not fut.done():
+                        fut.set_exception(exc)
+            finally:
+                self._get_in_flight = False
+                if self._get_batch:
+                    self._flush_get_batch(loop)
+
+        loop.create_task(_run())
+
     async def get(
         self,
         key: str,
@@ -598,8 +721,27 @@ class DAOSArrayStore(Store):
     ) -> Buffer | None:
         if prototype is None:
             prototype = default_buffer_prototype()
-        res = await self.get_partial_values(prototype, [(key, byte_range)])
-        return res[0]
+        if not _is_chunk_key(key) or (
+            self._chunk_bytes_hint is not None and self._chunk_bytes_hint > self._INLINE_THRESHOLD
+        ):
+            res = await self.get_partial_values(prototype, [(key, byte_range)])
+            return res[0]
+        await self._ensure_open()
+        if byte_range is not None and not isinstance(
+            byte_range, (RangeByteRequest, OffsetByteRequest, SuffixByteRequest)
+        ):
+            raise ValueError(f"Unexpected byte_range, got {byte_range!r}")
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Buffer | None] = loop.create_future()
+        if not hasattr(self, "_get_batch"):
+            self._get_batch = []
+            self._get_scheduled = False
+            self._get_in_flight = False
+        self._get_batch.append((key, byte_range, prototype, fut))
+        if not self._get_in_flight and not self._get_scheduled:
+            self._get_scheduled = True
+            loop.call_soon(self._flush_get_batch, loop)
+        return await fut
 
     async def get_partial_values(
         self,
@@ -649,8 +791,51 @@ class DAOSArrayStore(Store):
         raw_list = await loop.run_in_executor(_CTX.executor, _op)
         return [prototype.buffer.from_bytes(item) if item is not None else None for item in raw_list]
 
+    def _flush_set_batch(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._set_scheduled = False
+        if getattr(self, "_set_in_flight", False) or not self._set_batch:
+            return
+        self._set_in_flight = True
+        batch = self._set_batch[:64]
+        del self._set_batch[:64]
+
+        async def _run() -> None:
+            try:
+                items = [(fk, mv) for fk, mv, _ in batch]
+                await loop.run_in_executor(_CTX.executor, self._write_arrays_batch_sync, items)
+                for _, _, fut in batch:
+                    if not fut.done():
+                        fut.set_result(None)
+            except BaseException as exc:
+                for _, _, fut in batch:
+                    if not fut.done():
+                        fut.set_exception(exc)
+            finally:
+                self._set_in_flight = False
+                if self._set_batch:
+                    self._flush_set_batch(loop)
+
+        loop.create_task(_run())
+
     async def set(self, key: str, value: Buffer) -> None:
-        await self.set_many([(key, value)])
+        if not _is_chunk_key(key) or (
+            self._chunk_bytes_hint is not None and self._chunk_bytes_hint > self._INLINE_THRESHOLD
+        ):
+            await self.set_many([(key, value)])
+            return
+        await self._ensure_open()
+        self._check_writable()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        if not hasattr(self, "_set_batch"):
+            self._set_batch = []
+            self._set_scheduled = False
+            self._set_in_flight = False
+        self._set_batch.append((self._full_key(key), _buf_to_mv(value), fut))
+        if not self._set_in_flight and not self._set_scheduled:
+            self._set_scheduled = True
+            loop.call_soon(self._flush_set_batch, loop)
+        await fut
 
     async def set_many(self, values: Iterable[tuple[str, Buffer]]) -> None:
         await self._ensure_open()
@@ -739,8 +924,8 @@ class DAOSArrayStore(Store):
                 ),
                 "daos_kv_list",
             )
-            if nr.value == 0: 
-                break
+            if nr.value == 0:
+                continue
             offset = 0
             raw_bytes = buf.raw
             for i in range(nr.value):
