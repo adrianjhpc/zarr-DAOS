@@ -27,6 +27,7 @@ DAOS_OO_RW = 1 << 2
 
 # Object types (from /usr/include/daos_obj.h)
 DAOS_OT_KV_HASHED = 8
+DAOS_OT_ARRAY = 11
 DAOS_OT_ARRAY_BYTE = 13
 
 DAOS_EQ_NOWAIT = 0
@@ -101,6 +102,7 @@ class daos_array_iod_t(ctypes.Structure):
         ("arr_nr", daos_size_t),
         ("arr_rgs", ctypes.POINTER(daos_range_t)),
         ("arr_nr_short_read", daos_size_t),
+        ("arr_nr_read", daos_size_t),
     ]
 
 
@@ -117,6 +119,7 @@ DAOS_ANCHOR_TYPE_ZERO = 0
 DAOS_ANCHOR_TYPE_EOF = 3
 DAOS_ANCHOR_BUF_MAX = 104
 
+
 class daos_anchor_t(ctypes.Structure):
     _fields_ = [
         ("da_type", ctypes.c_uint16),
@@ -130,12 +133,6 @@ class daos_anchor_t(ctypes.Structure):
 def anchor_is_eof(anchor: daos_anchor_t) -> bool:
     return anchor.da_type == DAOS_ANCHOR_TYPE_EOF
 
-
-class daos_range_t(ctypes.Structure):
-    _fields_ = [
-        ("rg_idx", ctypes.c_uint64),  # offset FIRST
-        ("rg_len", ctypes.c_uint64),  # length SECOND
-    ]
 
 # Function prototypes
 libdaos.daos_init.argtypes = []
@@ -165,11 +162,11 @@ libdaos.daos_cont_close.restype = ctypes.c_int
 libdaos.daos_oclass_name2id.argtypes = [ctypes.c_char_p]
 libdaos.daos_oclass_name2id.restype = daos_oclass_id_t
 
-libdaos.daos_obj_generate_oid.argtypes = [
+libdaos.daos_obj_generate_oid2.argtypes = [
     daos_handle_t, ctypes.POINTER(daos_obj_id_t),
     ctypes.c_int, daos_oclass_id_t, daos_oclass_hints_t, ctypes.c_uint32,
 ]
-libdaos.daos_obj_generate_oid.restype = ctypes.c_int
+libdaos.daos_obj_generate_oid2.restype = ctypes.c_int
 
 # KV API
 libdaos.daos_kv_open.argtypes = [
@@ -264,6 +261,5 @@ def make_oid(coh: daos_handle_t, seed: str, otype: int, oclass: int) -> daos_obj
     lo = int.from_bytes(digest[:8], "little")
     hi = int.from_bytes(digest[8:], "little") & 0xFFFFFFFF
     oid = daos_obj_id_t(lo=lo, hi=hi)
-    check_rc(libdaos.daos_obj_generate_oid(coh, ctypes.byref(oid), otype, oclass, 0, 0), f"generate_oid({seed})")
+    check_rc(libdaos.daos_obj_generate_oid2(coh, ctypes.byref(oid), otype, oclass, 0, 0), f"generate_oid({seed})")
     return oid
-

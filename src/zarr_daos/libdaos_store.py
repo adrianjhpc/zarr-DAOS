@@ -159,6 +159,8 @@ class DAOSArrayStore(Store):
         _CTX.executor.submit(self._open_kv_sync).result()
 
     async def _open(self) -> None:
+        if self._is_open:
+            raise ValueError("store is already open")
         await super()._open()
         if self._kv_oh.value == ffi.DAOS_HDL_INVAL:
             _CTX.ensure_open(self.pool, self.cont)
@@ -176,6 +178,102 @@ class DAOSArrayStore(Store):
             ffi.libdaos.daos_kv_open(_CTX.coh, kv_oid, o_flags, ctypes.byref(self._kv_oh), None),
             "daos_kv_open",
         )
+
+    def _check_open(self) -> None:
+        if not self._is_open:
+            raise ValueError("store is closed")
+
+    def __getstate__(self) -> dict[str, object]:
+        return {
+            "pool": self.pool,
+            "cont": self.cont,
+            "prefix": self.prefix,
+            "read_only": self.read_only,
+            "stripe_size": self.stripe_size,
+            "_is_open": self._is_open,
+        }
+
+    def _ensure_open_sync(self) -> None:
+        if not self._is_open:
+            _CTX.ensure_open(self.pool, self.cont)
+            self._open_kv_sync()
+            self._is_open = True
+
+    def get_sync(
+        self,
+        key: str,
+        prototype: BufferPrototype | None = None,
+        byte_range: ByteRequest | None = None,
+    ) -> Buffer | None:
+        self._ensure_open_sync()
+        if prototype is None:
+            prototype = default_buffer_prototype()
+        if byte_range is not None and not isinstance(
+            byte_range, (RangeByteRequest, OffsetByteRequest, SuffixByteRequest)
+        ):
+            raise ValueError(f"Unexpected byte_range, got {byte_range!r}")
+
+        fkey = self._full_key(key)
+        if _is_chunk_key(key):
+            raw = self._read_arrays_batch_sync([(fkey, byte_range)])[0]
+        else:
+            raw = self._kv_get_sync(fkey)
+            if raw is not None and key.endswith("zarr.json"):
+                inferred = _infer_chunk_bytes_from_zarr_json(raw)
+                if inferred is not None:
+                    self._chunk_bytes_hint = inferred
+            if raw is not None and byte_range is not None:
+                if isinstance(byte_range, RangeByteRequest):
+                    raw = raw[byte_range.start : byte_range.end]
+                elif isinstance(byte_range, OffsetByteRequest):
+                    raw = raw[byte_range.offset :]
+                elif isinstance(byte_range, SuffixByteRequest):
+                    raw = raw[-byte_range.suffix :]
+
+        return prototype.buffer.from_bytes(raw) if raw is not None else None
+
+    def set_sync(self, key: str, value: Buffer) -> None:
+        self._ensure_open_sync()
+        self._check_writable()
+        fkey = self._full_key(key)
+        mv = _buf_to_mv(value)
+        if _is_chunk_key(key):
+            self._write_arrays_batch_sync([(fkey, mv)])
+        else:
+            self._kv_put_sync(fkey, mv)
+
+    def delete_sync(self, key: str) -> None:
+        self._ensure_open_sync()
+        self._check_writable()
+        fkey = self._full_key(key)
+        if _is_chunk_key(key):
+            oid = self._array_oid(fkey)
+            aoh = ffi.daos_handle_t()
+            cell_sz, chunk_sz = ffi.daos_size_t(), ffi.daos_size_t()
+            rc = ffi.libdaos.daos_array_open(
+                _CTX.coh, oid, ffi.DAOS_TX_NONE, ffi.DAOS_OO_RW,
+                ctypes.byref(cell_sz), ctypes.byref(chunk_sz), ctypes.byref(aoh), None,
+            )
+            if rc == 0:
+                ffi.libdaos.daos_array_destroy(aoh, ffi.DAOS_TX_NONE, None)
+                ffi.libdaos.daos_array_close(aoh, None)
+            # Also remove from KV index if tracked there
+            ffi.libdaos.daos_kv_remove(self._kv_oh, ffi.DAOS_TX_NONE, 0, fkey.encode("utf-8"), None)
+        else:
+            ffi.libdaos.daos_kv_remove(self._kv_oh, ffi.DAOS_TX_NONE, 0, fkey.encode("utf-8"), None)
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.pool = str(state["pool"])
+        self.cont = str(state["cont"])
+        self.prefix = str(state["prefix"])
+        self._read_only = bool(state["read_only"])
+        self.stripe_size = int(state["stripe_size"])  # type: ignore[arg-type]
+        self._kv_oh = ffi.daos_handle_t(ffi.DAOS_HDL_INVAL)
+        self._chunk_bytes_hint = None
+        self._is_open = bool(state["_is_open"])
+        if self._is_open:
+            _CTX.ensure_open(self.pool, self.cont)
+            _CTX.executor.submit(self._open_kv_sync).result()
 
     def close(self) -> None:
         super().close()
@@ -200,20 +298,51 @@ class DAOSArrayStore(Store):
         return _CTX.oc_sx if sz >= _STRIPE_THRESHOLD else _CTX.oc_s1
 
     def _array_oid(self, fkey: str, nbytes: int | None = None) -> ffi.daos_obj_id_t:
-        return ffi.make_oid(_CTX.coh, f"zarr_chunk:{fkey}", ffi.DAOS_OT_ARRAY_BYTE, self._select_oclass(nbytes))
+        return ffi.make_oid(_CTX.coh, f"zarr_chunk:{fkey}", ffi.DAOS_OT_ARRAY, self._select_oclass(nbytes))
 
     # --- KV metadata helpers ---
 
+    _INLINE_THRESHOLD: int = 262144  # 256 KiB
+
+    @staticmethod
+    def _slice_bytes(data: bytearray, br: ByteRequest | None) -> bytearray:
+        if br is None:
+            return data
+        if isinstance(br, RangeByteRequest):
+            return data[br.start : br.end]
+        if isinstance(br, OffsetByteRequest):
+            return data[br.offset :]
+        if isinstance(br, SuffixByteRequest):
+            return data[-br.suffix :] if br.suffix > 0 else bytearray(0)
+        return data
+
     def _kv_get_sync(self, fkey: str) -> bytearray | None:
         b_key = fkey.encode("utf-8")
+        # Fast path: 1-RPC fetch into a 256 KiB + 16 B buffer
+        buf_len = self._INLINE_THRESHOLD + 16
+        out = bytearray(buf_len)
+        c_buf = (ctypes.c_char * buf_len).from_buffer(out)
+        sz = ffi.daos_size_t(buf_len)
+        rc = ffi.libdaos.daos_kv_get(self._kv_oh, ffi.DAOS_TX_NONE, 0, b_key, ctypes.byref(sz), c_buf, None)
+        if rc == 0:
+            if sz.value == 0:
+                rel_key = fkey[len(self.prefix) + 1 :] if self.prefix else fkey
+                return bytearray(0) if rel_key in self._list_keys_sync() else None
+            del c_buf
+            del out[sz.value :]
+            return out
+        if rc == _DER_NONEXIST:
+            return None
+
+        # Fallback for values larger than buf_len: 2-step size query + fetch
         sz = ffi.daos_size_t(ffi.DAOS_REC_ANY)
         rc = ffi.libdaos.daos_kv_get(self._kv_oh, ffi.DAOS_TX_NONE, 0, b_key, ctypes.byref(sz), None, None)
         if rc == _DER_NONEXIST:
             return None
         ffi.check_rc(rc, f"kv_get_size({fkey})")
         if sz.value == 0:
-            return bytearray(0)
-
+            rel_key = fkey[len(self.prefix) + 1 :] if self.prefix else fkey
+            return bytearray(0) if rel_key in self._list_keys_sync() else None
         out = bytearray(sz.value)
         c_buf = (ctypes.c_char * sz.value).from_buffer(out)
         ffi.check_rc(
@@ -272,37 +401,57 @@ class DAOSArrayStore(Store):
             return
 
         non_empty: list[tuple[str, memoryview, ffi.daos_handle_t]] = []
+        large_keys: list[str] = []
         for fkey, mv in chunk_items:
             nbytes = len(mv)
-            aoh = self._open_or_create_array(fkey, nbytes)
-            if nbytes == 0:
-                # 0-byte array is already created with size 0; never post a 0-len async I/O
-                ffi.libdaos.daos_array_close(aoh, None)
+            if nbytes <= self._INLINE_THRESHOLD:
+                tagged = bytearray(nbytes + 1)
+                tagged[0] = 2  # inline KV payload marker
+                if nbytes:
+                    tagged[1:] = mv
+                self._kv_put_sync(fkey, memoryview(tagged))
             else:
+                aoh = self._open_or_create_array(fkey, nbytes)
                 non_empty.append((fkey, mv, aoh))
+                large_keys.append(fkey)
 
         m = len(non_empty)
         if m > 0:
             events = (ffi.daos_event_t * m)()
+            rgs = (ffi.daos_range_t * m)()
+            iovs = (ffi.d_iov_t * m)()
+            sgls = (ffi.d_sg_list_t * m)()
+            iods = (ffi.daos_array_iod_t * m)()
             keepalive: list[object] = []
 
             for i, (fkey, mv, aoh) in enumerate(non_empty):
                 nbytes = len(mv)
                 ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "event_init")
                 ptr, arr_keep = _mv_to_void_ptr(mv)
-                iov = ffi.d_iov_t(iov_buf=ptr, iov_buf_len=nbytes, iov_len=nbytes)
-                sgl = ffi.d_sg_list_t(sg_nr=1, sg_nr_out=0, sg_iovs=ctypes.pointer(iov))
-                rg = ffi.daos_range_t(rg_len=nbytes, rg_idx=0)
-                iod = ffi.daos_array_iod_t(arr_nr=1, arr_rgs=ctypes.pointer(rg), arr_nr_short_read=0)
-                keepalive.extend((arr_keep, iov, sgl, rg, iod))
+                keepalive.append(arr_keep)
+
+                iovs[i].iov_buf = ptr
+                iovs[i].iov_buf_len = nbytes
+                iovs[i].iov_len = nbytes
+
+                sgls[i].sg_nr = 1
+                sgls[i].sg_nr_out = 0
+                sgls[i].sg_iovs = ctypes.pointer(iovs[i])
+
+                rgs[i].rg_idx = 0
+                rgs[i].rg_len = nbytes
+
+                iods[i].arr_nr = 1
+                iods[i].arr_rgs = ctypes.pointer(rgs[i])
+                iods[i].arr_nr_short_read = 0
+                iods[i].arr_nr_read = 0
 
                 ffi.check_rc(
                     ffi.libdaos.daos_array_write(
-                        aoh, ffi.DAOS_TX_NONE, ctypes.byref(iod), ctypes.byref(sgl), ctypes.byref(events[i])
+                        aoh, ffi.DAOS_TX_NONE, ctypes.byref(iods[i]), ctypes.byref(sgls[i]), ctypes.byref(events[i])
                     ),
                     f"array_write_async({fkey})",
                 )
-
             ev_ptrs = (ctypes.POINTER(ffi.daos_event_t) * m)()
             completed = 0
             try:
@@ -319,7 +468,7 @@ class DAOSArrayStore(Store):
                     ffi.libdaos.daos_array_close(aoh, None)
 
         # Record chunk keys in KV index so StoreTests list/list_prefix/list_dir see all keys
-        for fkey, _ in chunk_items:
+        for fkey in large_keys:
             self._kv_put_sync(fkey, memoryview(b"\x01"))
 
     def _read_arrays_batch_sync(
@@ -331,7 +480,16 @@ class DAOSArrayStore(Store):
         results: list[bytearray | None] = [None] * len(chunk_reqs)
         active: list[tuple[int, ffi.daos_handle_t, bytearray, int, int]] = []
 
+        prefer_kv = (self._chunk_bytes_hint is None) or (self._chunk_bytes_hint <= self._INLINE_THRESHOLD)
         for idx, (fkey, br) in enumerate(chunk_reqs):
+            if prefer_kv:
+                kv_val = self._kv_get_sync(fkey)
+                if kv_val is None:
+                    continue
+                if len(kv_val) >= 1 and kv_val[0] == 2:
+                    results[idx] = self._slice_bytes(kv_val[1:], br)
+                    continue
+
             oid = self._array_oid(fkey)
             aoh = ffi.daos_handle_t()
             cell_sz, chunk_sz = ffi.daos_size_t(), ffi.daos_size_t()
@@ -340,6 +498,10 @@ class DAOSArrayStore(Store):
                 ctypes.byref(cell_sz), ctypes.byref(chunk_sz), ctypes.byref(aoh), None,
             )
             if rc == _DER_NONEXIST:
+                if not prefer_kv:
+                    kv_val = self._kv_get_sync(fkey)
+                    if kv_val is not None and len(kv_val) >= 1 and kv_val[0] == 2:
+                        results[idx] = self._slice_bytes(kv_val[1:], br)
                 continue
             ffi.check_rc(rc, f"array_open_ro({fkey})")
 
@@ -375,19 +537,36 @@ class DAOSArrayStore(Store):
             return results
 
         events = (ffi.daos_event_t * m)()
+        rgs = (ffi.daos_range_t * m)()
+        iovs = (ffi.d_iov_t * m)()
+        sgls = (ffi.d_sg_list_t * m)()
+        iods = (ffi.daos_array_iod_t * m)()
         keepalive: list[object] = []
+
         for i, (_, aoh, out, offset, length) in enumerate(active):
             ffi.check_rc(ffi.libdaos.daos_event_init(ctypes.byref(events[i]), _CTX.eqh, None), "event_init")
             c_buf = (ctypes.c_char * length).from_buffer(out)
-            iov = ffi.d_iov_t(iov_buf=ctypes.cast(c_buf, ctypes.c_void_p), iov_buf_len=length, iov_len=0)
-            sgl = ffi.d_sg_list_t(sg_nr=1, sg_nr_out=0, sg_iovs=ctypes.pointer(iov))
-            rg = ffi.daos_range_t(rg_len=length, rg_idx=offset)
-            iod = ffi.daos_array_iod_t(arr_nr=1, arr_rgs=ctypes.pointer(rg), arr_nr_short_read=0)
-            keepalive.extend((c_buf, iov, sgl, rg, iod))
+            keepalive.append(c_buf)
+
+            iovs[i].iov_buf = ctypes.cast(c_buf, ctypes.c_void_p)
+            iovs[i].iov_buf_len = length
+            iovs[i].iov_len = length
+
+            sgls[i].sg_nr = 1
+            sgls[i].sg_nr_out = 0
+            sgls[i].sg_iovs = ctypes.pointer(iovs[i])
+
+            rgs[i].rg_idx = offset
+            rgs[i].rg_len = length
+
+            iods[i].arr_nr = 1
+            iods[i].arr_rgs = ctypes.pointer(rgs[i])
+            iods[i].arr_nr_short_read = 0
+            iods[i].arr_nr_read = 0
 
             ffi.check_rc(
                 ffi.libdaos.daos_array_read(
-                    aoh, ffi.DAOS_TX_NONE, ctypes.byref(iod), ctypes.byref(sgl), ctypes.byref(events[i])
+                    aoh, ffi.DAOS_TX_NONE, ctypes.byref(iods[i]), ctypes.byref(sgls[i]), ctypes.byref(events[i])
                 ),
                 "array_read_async",
             )
@@ -414,9 +593,11 @@ class DAOSArrayStore(Store):
     async def get(
         self,
         key: str,
-        prototype: BufferPrototype = default_buffer_prototype,
+        prototype: BufferPrototype | None = None,
         byte_range: ByteRequest | None = None,
     ) -> Buffer | None:
+        if prototype is None:
+            prototype = default_buffer_prototype()
         res = await self.get_partial_values(prototype, [(key, byte_range)])
         return res[0]
 
@@ -425,9 +606,14 @@ class DAOSArrayStore(Store):
         prototype: BufferPrototype,
         key_ranges: Iterable[tuple[str, ByteRequest | None]],
     ) -> list[Buffer | None]:
-        self._check_open()
+        await self._ensure_open()
         loop = asyncio.get_running_loop()
         reqs = list(key_ranges)
+        for _, br in reqs:
+            if br is not None and not isinstance(
+                br, (RangeByteRequest, OffsetByteRequest, SuffixByteRequest)
+            ):
+                raise ValueError(f"Unexpected byte_range, got {br!r}")
 
         def _op() -> list[bytearray | None]:
             out: list[bytearray | None] = [None] * len(reqs)
@@ -467,9 +653,10 @@ class DAOSArrayStore(Store):
         await self.set_many([(key, value)])
 
     async def set_many(self, values: Iterable[tuple[str, Buffer]]) -> None:
-        self._check_open()
+        await self._ensure_open()
         self._check_writable()
         items = [(key, self._full_key(key), _buf_to_mv(buf)) for key, buf in values]
+        loop = asyncio.get_running_loop()
 
         def _op() -> None:
             chunk_items: list[tuple[str, memoryview]] = []
@@ -484,8 +671,8 @@ class DAOSArrayStore(Store):
         await loop.run_in_executor(_CTX.executor, _op)
 
     async def exists(self, key: str) -> bool:
-        fkey = self._full_key(key)
         await self._ensure_open()
+        fkey = self._full_key(key)
         loop = asyncio.get_running_loop()
 
         def _op() -> bool:
@@ -502,16 +689,21 @@ class DAOSArrayStore(Store):
                     return True
                 return False
             sz = ffi.daos_size_t(ffi.DAOS_REC_ANY)
-            return ffi.libdaos.daos_kv_get(
+            rc = ffi.libdaos.daos_kv_get(
                 self._kv_oh, ffi.DAOS_TX_NONE, 0, fkey.encode("utf-8"), ctypes.byref(sz), None, None
-            ) == 0
+            )
+            if rc != 0:
+                return False
+            if sz.value > 0:
+                return True
+            return key in self._list_keys_sync()
 
         return await loop.run_in_executor(_CTX.executor, _op)
 
     async def delete(self, key: str) -> None:
+        await self._ensure_open()
         self._check_writable()
         fkey = self._full_key(key)
-        await self._ensure_open()
         loop = asyncio.get_running_loop()
 
         def _op() -> None:
@@ -547,6 +739,8 @@ class DAOSArrayStore(Store):
                 ),
                 "daos_kv_list",
             )
+            if nr.value == 0: 
+                break
             offset = 0
             raw_bytes = buf.raw
             for i in range(nr.value):
@@ -559,6 +753,16 @@ class DAOSArrayStore(Store):
                 else:
                     keys.append(k_str)
         return keys
+
+
+    def with_read_only(self, read_only: bool = False) -> "DAOSArrayStore":
+        return type(self)(
+            pool=self.pool,
+            cont=self.cont,
+            prefix=self.prefix,
+            read_only=read_only,
+            stripe_size=self.stripe_size,
+        )
 
     async def list(self) -> AsyncGenerator[str, None]:
         await self._ensure_open()
